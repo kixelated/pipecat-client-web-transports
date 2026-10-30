@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 const captured = vi.hoisted(() => ({
   connections: [] as Array<Record<string, any>>,
   watchBroadcasts: [] as Array<Record<string, any>>,
+  syncs: [] as Array<Record<string, any>>,
 }));
 
 // @moq/hang's root barrel uses directory imports (`import * from
@@ -92,13 +93,15 @@ vi.mock("@moq/watch", async () => {
     Broadcast: class {
       props: Record<string, any>;
       constructor(props: Record<string, any>) {
+        if ("announced" in props) throw new Error("Watch.Broadcast: announced was renamed to follow");
+        if ("reload" in props) throw new Error("Watch.Broadcast: reload was renamed to follow");
         this.props = props;
         captured.watchBroadcasts.push(this);
       }
       close() {}
     },
     Sync: class {
-      constructor(_opts: unknown) {}
+      constructor(opts: Record<string, any>) { captured.syncs.push(opts); }
       close() {}
       reset() {}
     },
@@ -140,6 +143,7 @@ vi.mock("@moq/net", async () => {
     close() {}
   }
   return {
+    ...await vi.importActual<typeof import("@moq/net")>("@moq/net"),
     Connection,
     Path: { from: (...parts: string[]) => parts.join("/") },
   };
@@ -372,7 +376,7 @@ describe("MoqTransport — characterization", () => {
  * Transcript records carry `seq` and `epoch` so that the replay every
  * (re)subscribe gets is dropped rather than redelivered. These tests drive
  * the publish and drain paths with stand-ins for the @moq/json producer and
- * consumer; the stream itself is exercised against a relay, not here.
+ * consumer, plus a round-trip through the real compressed wire codec.
  */
 describe("MoqTransport — transcript records", () => {
   type Record = { [key: string]: unknown };
@@ -387,10 +391,10 @@ describe("MoqTransport — transcript records", () => {
   /** `_drainTranscript` and the transcript fields are internal. */
   type Internals = {
     _transcriptLog: Record[] | null;
-    _transcriptOut: { append: (r: Record) => void } | null;
+    _transcriptOut: { append: (r: { value: Record }) => void } | null;
     _transcriptEpoch: string | null;
     _drainTranscript: (
-      consumer: { next: () => Promise<Record | null> },
+      consumer: { next: () => Promise<{ value: Record } | null> },
       signal: AbortSignal,
     ) => Promise<void>;
   };
@@ -445,7 +449,7 @@ describe("MoqTransport — transcript records", () => {
 
   test("sendMessage() numbers each record from its position in the log and keeps the message itself unchanged", () => {
     const internals = transport as unknown as Internals;
-    const producer = { append: vi.fn<(r: Record) => void>() };
+    const producer = { append: vi.fn<(r: { value: Record }) => void>() };
     internals._transcriptLog = [];
     internals._transcriptEpoch = "e1";
     internals._transcriptOut = producer;
@@ -454,7 +458,7 @@ describe("MoqTransport — transcript records", () => {
     transport.sendMessage(first as never);
     transport.sendMessage(rtvi("client-message") as never);
 
-    expect(producer.append.mock.calls.map(([r]) => [r.seq, r.epoch, r.type])).toEqual([
+    expect(producer.append.mock.calls.map(([{ value: r }]) => [r.seq, r.epoch, r.type])).toEqual([
       [0, "e1", "client-ready"],
       [1, "e1", "client-message"],
     ]);
@@ -475,7 +479,10 @@ describe("MoqTransport — transcript records", () => {
       rtvi("bot-output", { seq: 2, epoch: "b1" }),
       null,
     ];
-    const consumer = { next: vi.fn(async () => script.shift() ?? null) };
+    const consumer = { next: vi.fn(async () => {
+      const value = script.shift();
+      return value ? { value } : null;
+    }) };
 
     await (transport as unknown as Internals)._drainTranscript(
       consumer,
@@ -500,7 +507,10 @@ describe("MoqTransport — transcript records", () => {
       rtvi("bot-output", { seq: 1, epoch: "b1" }),
       null,
     ];
-    const consumer = { next: vi.fn(async () => script.shift() ?? null) };
+    const consumer = { next: vi.fn(async () => {
+      const value = script.shift();
+      return value ? { value } : null;
+    }) };
 
     await (transport as unknown as Internals)._drainTranscript(
       consumer,
@@ -513,8 +523,8 @@ describe("MoqTransport — transcript records", () => {
   });
 
   test("_drainTranscript() returns when the stream ends without the marker", async () => {
-    // Stream end is the caller's cue to re-subscribe (the announced-gated
-    // origin request re-resolves); the drain itself neither disconnects
+    // Stream end is the caller's cue to re-subscribe (the announcement-gated
+    // follow request re-resolves); the drain itself neither disconnects
     // nor retries.
     const { callbacks } = buildSpyCallbacks();
     const { onMessage } = wireTransport(transport, callbacks);
@@ -522,7 +532,10 @@ describe("MoqTransport — transcript records", () => {
       .spyOn(transport as unknown as { _disconnect: () => Promise<void> }, "_disconnect")
       .mockResolvedValue(undefined);
     const script: (Record | null)[] = [rtvi("bot-output", { seq: 0, epoch: "b1" }), null];
-    const consumer = { next: vi.fn(async () => script.shift() ?? null) };
+    const consumer = { next: vi.fn(async () => {
+      const value = script.shift();
+      return value ? { value } : null;
+    }) };
 
     await (transport as unknown as Internals)._drainTranscript(
       consumer,
@@ -533,9 +546,33 @@ describe("MoqTransport — transcript records", () => {
     expect(disconnect).not.toHaveBeenCalled();
   });
 
+  test("transcript messages round-trip through the compressed wire codec", async () => {
+    const Moq = await vi.importActual<typeof import("@moq/net")>("@moq/net");
+    const Json = await vi.importActual<typeof import("@moq/json")>("@moq/json");
+    const track = new Moq.Track.Producer("transcript").accept({ compress: true });
+    const producer = new Json.Stream.Producer<Record>({ track });
+    const internals = transport as unknown as Internals;
+    internals._transcriptLog = [];
+    internals._transcriptEpoch = "wire-test";
+    internals._transcriptOut = producer;
+    const { callbacks } = buildSpyCallbacks();
+    const { onMessage } = wireTransport(transport, callbacks);
+
+    transport.sendMessage(rtvi("client-ready") as never);
+    transport.sendMessage(rtvi("client-message") as never);
+    producer.finish();
+    const consumer = new Json.Stream.Consumer<Record>({ track: track.subscribe() });
+    await internals._drainTranscript(consumer, new AbortController().signal);
+
+    expect(onMessage.mock.calls.map(([message]) => message)).toEqual([
+      rtvi("client-ready"),
+      rtvi("client-message"),
+    ]);
+  });
+
   test("_disconnect() sends the session-ending marker before tearing down", async () => {
     const internals = transport as unknown as Internals;
-    const producer = { append: vi.fn<(r: Record) => void>() };
+    const producer = { append: vi.fn<(r: { value: Record }) => void>() };
     internals._transcriptLog = [];
     internals._transcriptEpoch = "e1";
     internals._transcriptOut = producer;
@@ -543,7 +580,7 @@ describe("MoqTransport — transcript records", () => {
 
     await transport._disconnect();
 
-    expect(producer.append.mock.calls.map(([r]) => [r.label, r.type, r.seq, r.epoch])).toEqual([
+    expect(producer.append.mock.calls.map(([{ value: r }]) => [r.label, r.type, r.seq, r.epoch])).toEqual([
       ["moq-transport", "session-ending", 0, "e1"],
     ]);
     expect(transport.state).toBe("disconnected");
@@ -743,6 +780,7 @@ describe("MoqTransport — _connect wiring", () => {
   beforeEach(() => {
     captured.connections.length = 0;
     captured.watchBroadcasts.length = 0;
+    captured.syncs.length = 0;
     transport = new MoqTransport({ relayUrl: "https://relay.example/moq" });
   });
 
@@ -771,6 +809,13 @@ describe("MoqTransport — _connect wiring", () => {
     expect(
       connection.props.webtransport?.serverCertificateHashes,
     ).toHaveLength(1);
+  });
+
+  test("real-time playback keeps audio enabled with zero lookahead", async () => {
+    const { callbacks } = buildSpyCallbacks();
+    wireTransport(transport, callbacks);
+    await transport._connect({ relayUrl: "https://relay.example/moq", audioBufferMaxMs: "real-time" });
+    expect(captured.syncs).toEqual([{ delay: 0, buffer: 0 }]);
   });
 
   test("relayRetryTimeoutMs in connect params sets the retry window", async () => {
@@ -849,17 +894,16 @@ describe("MoqTransport — _connect wiring", () => {
 
     await transport._connect();
 
-    const [watchBroadcast] = captured.watchBroadcasts;
-    expect(watchBroadcast.props.announced.peek()).toBe(true);
+    expect(captured.watchBroadcasts).toHaveLength(1);
 
-    const request = vi.fn(() => ({
+    const follow = vi.fn(() => ({
       active: new Signal<unknown>(undefined),
       close: vi.fn(),
     }));
-    captured.connections[0].origin.set({ request });
+    captured.connections[0].origin.set({ follow });
     await tick();
 
-    expect(request).toHaveBeenCalledWith("pipecat/bot0", { announced: true });
+    expect(follow).toHaveBeenCalledWith("pipecat/bot0");
   });
 
   test("a bot republish re-resolves the origin request and re-subscribes the transcript", async () => {
@@ -868,8 +912,8 @@ describe("MoqTransport — _connect wiring", () => {
     await transport._connect();
 
     const active = new Signal<unknown>(undefined);
-    const request = vi.fn(() => ({ active, close: vi.fn() }));
-    captured.connections[0].origin.set({ request });
+    const follow = vi.fn(() => ({ active, close: vi.fn() }));
+    captured.connections[0].origin.set({ follow });
     await tick();
 
     const makeBroadcast = () => {
