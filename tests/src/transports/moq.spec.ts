@@ -93,6 +93,8 @@ vi.mock("@moq/watch", async () => {
     Broadcast: class {
       props: Record<string, any>;
       constructor(props: Record<string, any>) {
+        if ("announced" in props) throw new Error("Watch.Broadcast: announced was renamed to follow");
+        if ("reload" in props) throw new Error("Watch.Broadcast: reload was renamed to follow");
         this.props = props;
         captured.watchBroadcasts.push(this);
       }
