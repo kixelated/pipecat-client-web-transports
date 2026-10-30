@@ -145,8 +145,8 @@ export interface MoqTransportOptions {
    * Stays pinned because the transcript is a ``@moq/json`` stream track
    * (an ordered, lossless append-log, wire-compatible with the bot's Rust
    * ``moq_json::stream``), not a catalog rendition — the catalog only
-   * describes media tracks (audio/video). The ``.z`` suffix marks that the
-   * stream is compressed.
+   * describes media tracks (audio/video). Compression is negotiated through
+   * the track metadata.
    */
   transcriptTrack?: string;
 
@@ -524,10 +524,10 @@ export class MoqTransport extends Transport {
     // and the give-up watch below.
     this._connection = new Moq.Connection({
       enabled: this._reloadEnabled,
-      url: new Signal(url),
+      url: new Signal<URL | undefined>(url),
       webtransport,
       share: false,
-      delay: { timeout: merged.relayRetryTimeoutMs as Moq.Time.Milli },
+      delay: { timeout: merged.relayRetryTimeoutMs as Watch.Clock.Milli },
     });
     const connection = this._connection;
 
@@ -618,12 +618,11 @@ export class MoqTransport extends Transport {
     this._signals.run((eff) => {
       const net = eff.get(this._publishBroadcast!.net);
       if (!net) return;
-      const track = net.createTrack(merged.transcriptTrack);
+      const track = net.createTrack(merged.transcriptTrack, { compress: true });
       const producer = new Json.Stream.Producer<TranscriptRecord>({
         track,
-        compression: "deflate",
       });
-      for (const record of this._transcriptLog ?? []) producer.append(record);
+      for (const record of this._transcriptLog ?? []) producer.append({ value: record });
       this._transcriptOut = producer;
       eff.cleanup(() => {
         if (this._transcriptOut === producer) this._transcriptOut = null;
@@ -669,22 +668,18 @@ export class MoqTransport extends Transport {
       // reset. `Watch.Broadcast` self-gates the catalog + audio on the
       // announcement, (re)subscribing when the bot appears and again across
       // reconnects — no manual retry needed.
-      announced: new Signal(true),
       name: new Signal(botPath),
       catalogFormat: new Signal<Watch.CatalogFormat>("hang"),
     });
 
     // Latency: `delay` is the interactive jitter floor (audioLatencyMs);
     // `buffer` is how much faster-than-real-time TTS the player holds
-    // before dropping (audioBufferMaxMs). "real-time" collapses to
-    // "instant" (present ASAP, no lookahead).
+    // before dropping (audioBufferMaxMs). "real-time" uses zero delay
+    // and lookahead; Sync's "instant" mode disables audio.
     const realTime = merged.audioBufferMaxMs === "real-time";
     this._sync = new Watch.Sync({
-      probe: connection.probe,
-      delay: realTime
-        ? "instant"
-        : (merged.audioLatencyMs as Moq.Time.Milli),
-      buffer: (realTime ? 0 : merged.audioBufferMaxMs) as Moq.Time.Milli,
+      delay: (realTime ? 0 : merged.audioLatencyMs) as Watch.Clock.Milli,
+      buffer: (realTime ? 0 : merged.audioBufferMaxMs) as Watch.Clock.Milli,
     });
     this._audioSource = new Watch.Audio.Source({
       broadcast: new Signal<Watch.Broadcast | undefined>(this._watchBroadcast),
@@ -748,7 +743,7 @@ export class MoqTransport extends Transport {
     // re-subscribed on every (re-)announce. @moq/json's stream Consumer
     // yields every appended record in order, losslessly.
     //
-    // Consuming goes through the origin: `request(botPath, {announced: true})`
+    // Consuming goes through the origin: `follow(botPath)`
     // gates the subscribe on the bot's announcement. `req.active` resolves
     // once the bot serves the path and swaps across reconnects and
     // republishes, since the request is held on the origin, which spans
@@ -757,11 +752,11 @@ export class MoqTransport extends Transport {
       const origin = eff.get(connection.origin);
       if (!origin) return;
       // Gate on the bot's announcement (same as the catalog/audio above):
-      // `announced: true` makes the request resolve `active` only once the
+      // Following makes the request resolve `active` only once the
       // bot serves the path, so the subscribe never races the cold-start.
       // `active` re-resolves across reconnects/republishes, and the inner
       // effect re-subscribes each time.
-      const req = origin.request(botPath, { announced: true });
+      const req = origin.follow(botPath);
       const inner = new Effect();
       inner.run((e2) => {
         const botBroadcast = e2.get(req.active);
@@ -771,7 +766,6 @@ export class MoqTransport extends Transport {
           .subscribe({ priority: 0 });
         const consumer = new Json.Stream.Consumer<TranscriptRecord>({
           track,
-          compression: "deflate",
         });
         const ac = new AbortController();
         this._drainTranscript(consumer, ac.signal).catch((e) => {
@@ -1088,7 +1082,7 @@ export class MoqTransport extends Transport {
       epoch: this._transcriptEpoch ?? undefined,
     };
     this._transcriptLog.push(record);
-    this._transcriptOut?.append(record);
+    this._transcriptOut?.append({ value: record });
     return true;
   }
 
@@ -1115,8 +1109,9 @@ export class MoqTransport extends Transport {
     signal: AbortSignal,
   ): Promise<void> {
     for (;;) {
-      const record = await consumer.next();
-      if (!record || signal.aborted) break;
+      const next = await consumer.next();
+      if (!next || signal.aborted) break;
+      const record = next.value;
       if (typeof record !== "object") continue;
       const message = acceptTranscriptRecord(this._peerWatermark, record);
       if (!message) continue;
@@ -1145,7 +1140,7 @@ export class MoqTransport extends Transport {
       this._onMessage?.(message);
     }
     // The stream ended (the bot left, or a relay between the peers
-    // dropped it). The origin request re-resolves when the bot
+    // dropped it). The follow request re-resolves when the bot
     // republishes and the subscribe effect re-runs; the connection
     // reconnects the relay session on its own.
   }
